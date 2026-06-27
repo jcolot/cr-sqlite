@@ -157,6 +157,125 @@ wrapper against upstream's `sqlite-api.js`, and run cr-sqlite's existing trigger
 async seam behaves on the first VFS, the rest is small. If it fights on
 concurrency, that's where the time goes.
 
+# Android / Capacitor deployment
+
+Separate question from the v1.x migration: how to get cr-sqlite into a
+**Capacitor Android** app. There are three paths; the choice hinges on two
+verified facts about the Android WebView and the main Capacitor SQLite plugin.
+
+## The two facts that decide everything
+
+1. **Android WebView cannot do cross-origin isolation / `SharedArrayBuffer`.**
+   It has no site isolation / multi-process, so COOP/COEP headers won't grant
+   `crossOriginIsolated` no matter what you set. This kills sqlite.org's official
+   OPFS WASM (which needs SAB) — **but not** wa-sqlite's `AccessHandlePoolVFS` /
+   `OPFSCoopSyncVFS`, which are designed to run synchronously in a Worker
+   **without** SAB. OPFS sync access handles themselves need only a Worker + a
+   recent-enough Chromium (≈ Chrome 102+), not SAB. So wa-sqlite OPFS *can* run
+   on Android WebView where sqlite-wasm OPFS can't.
+
+2. **`@capacitor-community/sqlite` has no usable extension loading on Android.**
+   `loadExtension`/`enableLoadExtension` exist in the TS API (since 5.0.6) but are
+   commented out in the `CapacitorSQLitePlugin` bridge interface and absent from
+   the Android native code (`Database.java`, `CapacitorSQLite.java`). Its Android
+   engine is a **prebuilt SQLCipher AAR** (`net.zetetic:sqlcipher-android:4.10.0`)
+   and it compiles **no native code** (no `externalNativeBuild`/cmake/ndk). So
+   you cannot load `crsqlite.so` at runtime, and you cannot cleanly inject
+   cr-sqlite into its binary engine.
+
+## Three paths
+
+| Path | What | Effort | When |
+|---|---|---|---|
+| 1. Native static-link | bake cr-sqlite into a custom `libsqlite.so` | moderate–high | best perf / true native |
+| 2. WASM + OPFS (SAB-free VFS) | `AccessHandlePoolVFS`/`OPFSCoopSyncVFS` in a Worker | moderate | all-WASM, decent storage |
+| 3. WASM + IndexedDB | current vlcn build as-is | none | works today, slower |
+
+Note path 1 is *not* "just call `loadExtension`" — see fact 2. Given that gap,
+path 2 is often the lower-effort way onto Android because it stays entirely in
+JS/build (no JNI/NDK).
+
+## Path 1 — native static-link (the PowerSync pattern)
+
+Principle: don't load at runtime; **bake cr-sqlite into a custom SQLite build**
+via `SQLITE_EXTRA_INIT` — the exact mechanism `core/src/core_init.c` already
+implements for WASM. It's the WASM recipe with **NDK instead of emcc** and a
+**JNI host instead of a JS host**.
+
+```
+Capacitor app (JS)
+  └─ thin Capacitor SQLite plugin (Java)
+       └─ JNI binding (requery sqlite-android, built FROM SOURCE)
+            └─ libsqlite.so
+                 ├─ sqlite3.c + core_init.c   (-DSQLITE_EXTRA_INIT=core_init)
+                 └─ libcrsql_bundle_static.a  (per ABI)
+```
+
+Stage 1 — Rust core → static lib per ABI (crate `crsql_bundle_static`, same
+features as WASM):
+
+```bash
+rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
+cargo install cargo-ndk
+cd core/rs/bundle_static
+cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 \
+  build --release --features static,omit_load_extension
+# → libcrsql_bundle_static.a per ABI
+```
+
+Stage 2 — custom `libsqlite.so` (entry symbol `sqlite3_crsqlite_init`,
+`core/src/crsqlite.c:45`):
+
+```cmake
+add_library(sqlite3x SHARED sqlite3.c core_init.c <jni-glue>.c)
+target_compile_definitions(sqlite3x PRIVATE
+  SQLITE_EXTRA_INIT=core_init
+  SQLITE_ENABLE_FTS5 SQLITE_ENABLE_BYTECODE_VTAB
+  SQLITE_THREADSAFE=1)            # native keeps 1 (WASM used 0)
+target_link_libraries(sqlite3x
+  ${CMAKE_CURRENT_SOURCE_DIR}/jniLibs/${ANDROID_ABI}/libcrsql_bundle_static.a log)
+```
+
+`core_init.c` is verbatim from this repo.
+
+Stage 3 — package as `.aar` shipping the `.so` for the 3 ABIs + the JNI Java.
+
+### Variant choice (verified)
+
+- **Variant A — substitute into the community plugin: NOT viable.** Its engine is
+  a binary SQLCipher AAR; you'd have to build SQLCipher-from-source with cr-sqlite
+  linked. Only worth it if you need at-rest **encryption**.
+- **Variant B — custom thin plugin (recommended).** Use `io.requery:sqlite-android`
+  **built from source** (it has its own NDK `externalNativeBuild` compiling
+  `sqlite3.c`) as the JNI host — drop `core_init.c` + the define + the `.a` into
+  its build, then wrap with a small `open/execute/query/close` plugin. No
+  SQLCipher, you control the SQLite version.
+
+### Gotchas
+
+- **bindgen for Android:** the Rust core bindgens against `sqlite3.h`; set
+  `BINDGEN_EXTRA_CLANG_ARGS=--sysroot=$NDK/.../sysroot` and match the amalgamation
+  version (WASM pins 3.45).
+- **SQLite version match** between the amalgamation and what the core bindgen'd
+  against.
+- **APK size:** the `.a` links into each ABI — a few MB; trim with `abiFilters`.
+- **`crsql_finalize()` before close**, mirroring the WASM wrapper's `DB.close()`.
+
+## Path 2 — WASM + OPFS
+
+Use `OPFSCoopSyncVFS` (or `AccessHandlePoolVFS` for a single WebView) with the
+**synchronous** cr-sqlite build (`crsqlite-sync.mjs`) in a Worker; feature-detect
+`createSyncAccessHandle`. No COOP/COEP needed (fact 1). This is the v1.x VFS work
+already scoped above — all JS/build, no native. Falls back to Path 3 when sync
+access handles aren't available on a device's WebView.
+
+## Recommendation
+
+- Need encryption or maximum native perf → Path 1 Variant B (custom plugin +
+  requery-from-source), accept the NDK/bindgen build.
+- Want least native work → Path 2 (SAB-free OPFS VFS), reusing the v1.x VFS work.
+- Want it working now → Path 3 (IndexedDB), the current build, unchanged.
+
 ## Local checkouts used for this analysis
 
 - `~/Workspace/vlcn-js` — fork of `vlcn-io/js` (the wrapper)
