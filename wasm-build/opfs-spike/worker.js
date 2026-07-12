@@ -133,6 +133,52 @@ async function main() {
     await sqlite3.close(db);
   } catch (e) { fail("reopen: " + e); }
 
+  // --- 4. throughput benchmark (Step 1) ----------------------------------
+  // Same code path on desktop Chrome and inside the Android Capacitor WebView, so the
+  // two numbers are directly comparable. Measures cr-sqlite's CRR write path + scans
+  // over OPFS — the "is WASM/OPFS fast enough vs native?" question.
+  if (failures === 0) {
+    info("\n— benchmark (identical on desktop + Android WebView) —");
+    const N = 10000;
+    let bdb;
+    try {
+      bdb = await sqlite3.open_v2("bench.db", OPEN, vfs.name);
+      await sqlite3.exec(bdb, "CREATE TABLE bench (id INTEGER PRIMARY KEY NOT NULL, a INTEGER, b TEXT)");
+      await sqlite3.exec(bdb, "SELECT crsql_as_crr('bench')");
+
+      // Bulk insert N rows in one transaction (OPFS-write / CRR-trigger bound).
+      let s = performance.now();
+      await sqlite3.exec(bdb,
+        `WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM seq WHERE x < ${N})
+         INSERT INTO bench(id, a, b) SELECT x, x * 2, 'row-' || x FROM seq`);
+      const insMs = performance.now() - s;
+      info(`  CRR bulk insert : ${N} rows in ${insMs.toFixed(0)} ms  →  ${Math.round(N / (insMs / 1000)).toLocaleString()} rows/s`);
+
+      // Full-table scan.
+      s = performance.now();
+      const agg = await queryAll(sqlite3, bdb, "SELECT count(*), sum(a) FROM bench");
+      info(`  full scan       : ${agg[0][0].toLocaleString()} rows in ${(performance.now() - s).toFixed(1)} ms`);
+
+      // Point lookups by PK (index path).
+      s = performance.now();
+      for (let i = 0; i < 1000; i++) await queryAll(sqlite3, bdb, `SELECT b FROM bench WHERE id = ${1 + ((i * 997) % N)}`);
+      const lookupMs = performance.now() - s;
+      info(`  1000 pk lookups : ${lookupMs.toFixed(0)} ms  →  ${Math.round(1000 / (lookupMs / 1000)).toLocaleString()} q/s`);
+
+      const chg = await queryAll(sqlite3, bdb, "SELECT count(*) FROM crsql_changes");
+      const pc = await queryAll(sqlite3, bdb, "PRAGMA page_count");
+      const ps = await queryAll(sqlite3, bdb, "PRAGMA page_size");
+      info(`  crsql_changes   : ${chg[0][0].toLocaleString()} rows`);
+      info(`  db size on OPFS : ${((pc[0][0] * ps[0][0]) / 1048576).toFixed(2)} MB`);
+
+      try { await sqlite3.exec(bdb, "SELECT crsql_finalize()"); } catch {}
+      await sqlite3.close(bdb);
+    } catch (e) {
+      info("  benchmark error: " + e);
+      try { if (bdb) await sqlite3.close(bdb); } catch {}
+    }
+  }
+
   post(failures === 0 ? "\n🟢 ALL CHECKS PASSED — cr-sqlite runs on OPFS." : `\n🔴 ${failures} CHECK(S) FAILED.`,
        failures === 0 ? "pass" : "fail");
   self.postMessage({ done: true, failures });
