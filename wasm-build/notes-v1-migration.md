@@ -17,7 +17,10 @@ environment (Worker + cross-origin isolation).
 > build (`wasm-build/build-v1.sh` + `harness-overrides-v1/`), the spike
 > (`wasm-build/opfs-spike-v1/`), the benchmark (writes/scans ~2× faster than v0),
 > and the one hard constraint we found: cr-sqlite needs a **fully synchronous**
-> OPFS VFS (`AccessHandlePoolVFS`), not the cooperative `OPFSCoopSyncVFS`.
+> OPFS VFS (`AccessHandlePoolVFS`), not the cooperative `OPFSCoopSyncVFS`. The
+> `@vlcn.io/crsqlite-wasm` DB/TX/Stmt wrapper is repointed onto v1 too (merged in
+> `jcolot/js`; validated in `opfs-spike-v1-wrapper/`). Note the **single-connection /
+> multi-tab constraint** documented below — plan for one owning Worker per origin.
 
 ## The stack and who owns what
 
@@ -320,16 +323,69 @@ The pk-lookup number came out lower in this run; it runs last in the harness, so
 likely warmup/ordering rather than a real regression — worth re-measuring if it
 matters.
 
-### Still open (not blockers for "does v1 work")
+### The JS wrapper is repointed too (verified)
 
-- The **JS wrapper** (`@vlcn.io/crsqlite-wasm` DB/TX/Stmt) hasn't been repointed at the
-  v1 module + `sqlite-api.js` yet — the spike talks to `sqlite-api.js` directly. That's
-  the "near-portable wrapper" work from the analysis above.
-- Same **toolchain caveat as v0**: emscripten 6.x backs a growable heap with a
-  resizable `ArrayBuffer` that its own glue (`UTF8ToString`) and OPFS reject, so the
-  build uses `ALLOW_MEMORY_GROWTH=0` + a fixed 128 MB heap. A production build should
-  either keep a fixed heap or find the emscripten flag that keeps growth without a
-  resizable buffer.
+`@vlcn.io/crsqlite-wasm`'s DB/TX/Stmt facade now runs on v1 (see `jcolot/js`, merged).
+`TX` uses v1's `statements()` iterator (the `str_new`/`prepare_v2` API was removed);
+`Stmt` drops the `str` handle; `index.ts` loads the v1 module + registers
+`AccessHandlePoolVFS`. Validated end-to-end in `wasm-build/opfs-spike-v1-wrapper/`
+(the compiled facade drives open / exec / execA / execO / prepare+Stmt / createFunction
+/ onUpdate / tx / close+reopen green over OPFS).
+
+Note found while validating: **`onUpdate` reports cr-sqlite's internal backing tables**
+(`<tbl>__crsql_pks`, `<tbl>__crsql_clock`), not the logical CRR table — because CRR
+writes physically land there. Consumers filtering update events by user-table name must
+account for this (true on v0 and v1).
+
+### ⚠ Concurrency / multi-tab limitations (important)
+
+The chosen VFS, `AccessHandlePoolVFS`, is **single-connection**. OPFS
+`FileSystemSyncAccessHandle` takes an **exclusive** lock on each file across the whole
+origin, and the pool pre-acquires those handles at `create()`. Consequences:
+
+- **Two tabs, same database → the second tab fails to open.** Tab 1 holds the OPFS
+  access handles; tab 2's `AccessHandlePoolVFS.create()` can't acquire them and
+  `createSyncAccessHandle` throws (`NoModificationAllowedError`), so `initWasm` rejects.
+  There is no automatic cross-tab sharing.
+- **Worker-only**: OPFS sync access handles aren't available on the main thread in all
+  browsers, so the DB must live in a Worker (the spike/Capacitor architecture already
+  does this).
+
+This is *not* specific to cr-sqlite or to v1 — it's inherent to the fully-synchronous
+OPFS-pool approach. And it's the flip side of the constraint above: the VFS that *does*
+support cooperative multi-tab access, `OPFSCoopSyncVFS` (releases handles between
+transactions, coordinates via Web Locks), is exactly the one that breaks cr-sqlite's
+open-time extension init. So on the sync build you get **fast + single-connection**, and
+you cannot simply switch to the cooperative VFS to get multi-tab.
+
+**How to actually support multiple tabs** (standard OPFS pattern, unchanged by cr-sqlite):
+
+1. **One owner, many clients (recommended).** Put the DB in a *single* shared owner — a
+   `SharedWorker`, or a dedicated Worker elected via `navigator.locks` leader election —
+   and have every tab talk to it over `MessagePort`. All tabs share one connection, so
+   the exclusive-handle constraint is satisfied by construction. This is also the exact
+   shape the Capacitor plan uses (a Worker owns the DB). cr-sqlite's `onUpdate` in the
+   owner can broadcast change notifications to all tabs.
+2. **IndexedDB VFS instead of OPFS.** `IDBBatchAtomicVFS` (v0/vlcn default, also in v1)
+   coordinates multiple connections via Web Locks + batch-atomic writes, so it tolerates
+   multiple tabs directly — at a real performance cost vs OPFS (IDB is the slow path).
+   Viable if genuine multi-connection-without-a-shared-worker is required.
+3. **Model tabs as CRDT peers (usually overkill).** Since cr-sqlite *is* a CRDT, two
+   tabs could in principle hold separate databases (distinct `crsql_site_id`s) and sync
+   via `crsql_changes`. Correct, but far heavier than a shared worker for same-origin
+   tabs; only sensible if you already have a sync layer.
+
+Bottom line: **plan for a single owning Worker per origin.** The single-connection VFS
+is a feature (fast, simple) as long as the app funnels all tabs through one owner; it's
+only a limitation if you try to open the same OPFS database from multiple contexts
+concurrently.
+
+### Toolchain caveat (same as v0)
+
+emscripten 6.x backs a growable heap with a resizable `ArrayBuffer` that its own glue
+(`UTF8ToString`) and OPFS reject, so the build uses `ALLOW_MEMORY_GROWTH=0` + a fixed
+128 MB heap. A production build should keep a fixed heap or find the emscripten flag
+that keeps growth without a resizable buffer.
 
 # Android / Capacitor deployment
 
