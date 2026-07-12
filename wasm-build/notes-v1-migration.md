@@ -11,6 +11,14 @@ code, not authoring it. The genuine costs are two non-code things: re-validating
 cr-sqlite's reentrant SQL under upstream's async model, and the OPFS deployment
 environment (Worker + cross-origin isolation).
 
+> **UPDATE 2026-07-12 — this migration was built and proven.** cr-sqlite's core
+> now compiles + links against the upstream v1.1.1 harness (SQLite 3.53) and runs
+> green on OPFS in Chrome. See "✅ v1.x migration — built and proven" below for the
+> build (`wasm-build/build-v1.sh` + `harness-overrides-v1/`), the spike
+> (`wasm-build/opfs-spike-v1/`), the benchmark (writes/scans ~2× faster than v0),
+> and the one hard constraint we found: cr-sqlite needs a **fully synchronous**
+> OPFS VFS (`AccessHandlePoolVFS`), not the cooperative `OPFSCoopSyncVFS`.
+
 ## The stack and who owns what
 
 ```
@@ -233,6 +241,95 @@ Fixed by pre-generating them (`make crsqlite-extra` +
 Reproduce: `cd wasm-build/opfs-spike && node serve.mjs`, open in Chrome. See that
 dir's `README.md`. (The `crsqlite-sync.*` artifacts there are the fixed sync
 debug build.)
+
+# ✅ v1.x migration — built and proven (2026-07-12)
+
+We didn't just analyze the migration; we did it. cr-sqlite's core is built against
+the **upstream rhashimoto/wa-sqlite v1.1.1** harness (SQLite 3.53) and runs green on
+OPFS in Chrome.
+
+### What was built
+
+- **`wasm-build/build-v1.sh`** — companion to `build.sh`, targeting the upstream v1
+  harness instead of vlcn 0.22. Same modern unpinned toolchain (Rust core as a wasm
+  staticlib), reuses build.sh's emsdk. Builds the **sync** target `wa-sqlite.mjs`.
+- **`wasm-build/harness-overrides-v1/Makefile`** — upstream v1's Makefile with
+  cr-sqlite injected: `CFILES_EXTRA` (crsqlite.c / changes-vtab.c / ext-data.c),
+  `sqlite3.c` → `sqlite3-extra.c` (amalgamation + `core_init.c` for
+  `SQLITE_EXTRA_INIT`), `WASQLITE_EXTRA_DEFINES`, and the Rust staticlib linked into
+  the sync target.
+- **`wasm-build/opfs-spike-v1/`** — the v1 spike (new `VFS.create(name, module)` API,
+  `vfs_register(vfs, true)`, `const async=false` for the sync build). Same checks +
+  benchmark as the v0 spike, served by `serve.mjs`.
+
+### How the v1 harness differs from vlcn 0.22 (all handled, all mechanical)
+
+- Compiles `sqlite3.c` directly (we still concat `core_init.c` into `sqlite3-extra.c`).
+- `main.c` (not `libmodule.c`) holds `int main(){ sqlite3_initialize(); }` — same
+  `SQLITE_EXTRA_INIT=core_init` hook mechanism.
+- Three build variants: sync `wa-sqlite.mjs`, `wa-sqlite-async.mjs` (Asyncify),
+  `wa-sqlite-jspi.mjs` (JSPI). We build the **sync** one.
+- VFS base is `FacadeVFS` + `libadapters.js` (built into the `.mjs`); VFS API is
+  `static async create(name, module)`, methods are `jOpen/jRead/…` on raw pointers.
+- `sqlite-api.js` still hardcodes `const async = true`; flip to `false` for the sync
+  build (same seam as vlcn).
+
+### Two build bugs found — both inherited from upstream, neither cr-sqlite's
+
+- **macOS/BSD `cmp`**: upstream's extension-functions checksum rule is
+  `echo SHA | cmp deps/sha3`, which relies on GNU `cmp` reading file2 from stdin;
+  BSD `cmp` errors. Fixed to a two-file compare.
+- **`OMIT_UTF16` vs export list**: upstream's `exported_functions.json` exports the
+  `sqlite3_*16` entry points, so `-DSQLITE_OMIT_UTF16` (a vlcn size opt) breaks the
+  link. Dropped it.
+
+### The one hard constraint: cr-sqlite needs a *fully synchronous* OPFS VFS
+
+First tried `OPFSCoopSyncVFS` (upstream's flagship sync-build OPFS VFS). It failed at
+`open_v2` with `SQLITE_ERROR`. Traced via the VFS's own log: the DB opens and the
+header is read, then the VFS's **cooperative locking** releases the access handle and,
+on the next `jLock` (SHARED), returns `SQLITE_BUSY` and defers to an **async**
+lock-acquire (`navigator.locks` + `retryOps`). That BUSY lands *inside* cr-sqlite's
+`core_init` auto-extension, which runs SQL during `sqlite3_open` — and that open-time
+SQL cannot be retried at the JS boundary. Result: `SQLITE_ERROR`; the async lock
+resolves too late.
+
+Switching to **`AccessHandlePoolVFS`** (fully synchronous: fixed pre-acquired handle
+pool, no `navigator.locks`, no BUSY/retry) → **all green**. This is the same VFS the v0
+spike used, so the rule generalizes:
+
+> **cr-sqlite requires a fully-synchronous OPFS VFS.** Any VFS that returns
+> `SQLITE_BUSY` and defers to an async retry (cooperative locking) collides with
+> cr-sqlite's open-time extension init. Use `AccessHandlePoolVFS`, not
+> `OPFSCoopSyncVFS`. (An async build — Asyncify/JSPI — would tolerate the cooperative
+> VFS, but that reintroduces the Asyncify stack-overflow risk; the sync build +
+> `AccessHandlePoolVFS` is the clean combination.)
+
+### Benchmark: v1 vs v0 (desktop Chrome, same harness code)
+
+| Metric            | v0 (vlcn 0.22, SQLite 3.45) | v1 (rhashimoto 1.1.1, SQLite 3.53) |
+| ----------------- | --------------------------- | ---------------------------------- |
+| CRR bulk insert   | 42,481 rows/s               | **77,160 rows/s** (~1.8×)          |
+| full scan (10k)   | 3.1 ms                      | **1.5 ms** (~2×)                   |
+| 1000 pk lookups   | 25,063 q/s                  | 11,601 q/s                         |
+| crsql_changes     | 20,000 rows                 | 20,000 rows                        |
+| db size on OPFS   | 1.05 MB                     | 1.05 MB                            |
+
+Writes and scans are markedly faster on the v1 build (SQLite 3.53 + upstream's VFS).
+The pk-lookup number came out lower in this run; it runs last in the harness, so it's
+likely warmup/ordering rather than a real regression — worth re-measuring if it
+matters.
+
+### Still open (not blockers for "does v1 work")
+
+- The **JS wrapper** (`@vlcn.io/crsqlite-wasm` DB/TX/Stmt) hasn't been repointed at the
+  v1 module + `sqlite-api.js` yet — the spike talks to `sqlite-api.js` directly. That's
+  the "near-portable wrapper" work from the analysis above.
+- Same **toolchain caveat as v0**: emscripten 6.x backs a growable heap with a
+  resizable `ArrayBuffer` that its own glue (`UTF8ToString`) and OPFS reject, so the
+  build uses `ALLOW_MEMORY_GROWTH=0` + a fixed 128 MB heap. A production build should
+  either keep a fixed heap or find the emscripten flag that keeps growth without a
+  resizable buffer.
 
 # Android / Capacitor deployment
 

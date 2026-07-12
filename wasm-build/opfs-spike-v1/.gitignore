@@ -1,0 +1,9 @@
+# Build artifacts (produced by wasm-build/build.sh; see README.md).
+crsqlite*.mjs
+crsqlite*.wasm
+crsqlite*.symbols
+*.bak
+wa-sqlite*.mjs
+wa-sqlite*.wasm
+wa-sqlite*.symbols
+*.bak
