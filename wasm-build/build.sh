@@ -69,6 +69,17 @@ cp "$HERE/harness-overrides/extra_exported_runtime_methods.json" src/extra_expor
 # 4. Build -----------------------------------------------------------------
 export CRSQLITE_COMMIT_SHA="$(git -C "$CORE_DIR" rev-parse HEAD)"
 rm -rf tmp dist
+
+# Pre-generate the amalgamated SQLite sources BEFORE `make dist`. The Makefile's
+# `deps` target is an empty .PHONY (inherited from vlcn), so it does not actually
+# build deps/$SQLITE_VERSION/sqlite3-extra.c or deps/extension-functions.c. Those
+# are prerequisites of the dist objects only via vpath, which requires the files to
+# already exist on disk when the object graph is evaluated — otherwise `make dist`
+# aborts with "No rule to make target tmp/obj/dist/sqlite3-extra.o". Generating them
+# in a prior make invocation puts them where vpath can find them.
+make crsqlite-extra                 # -> deps/$SQLITE_VERSION/{sqlite3.c,sqlite3-extra.c}
+make deps/extension-functions.c     # -> deps/extension-functions.c (fetched + sha-checked)
+
 make dist
 
 mkdir -p "$HERE/dist"
