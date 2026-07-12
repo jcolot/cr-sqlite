@@ -1,0 +1,42 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>cr-sqlite × OPFS — Step-0 spike</title>
+<style>
+  body { font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; margin: 24px; background:#0b0e14; color:#c9d1d9; }
+  h1 { font-size: 15px; color:#8b949e; font-weight:600; }
+  #status { padding:6px 10px; border-radius:6px; display:inline-block; margin-bottom:12px; }
+  .running { background:#1f2937; color:#9ca3af; }
+  .pass { color:#3fb950; }
+  .fail { color:#f85149; }
+  .info { color:#8b949e; }
+  pre { white-space:pre-wrap; margin:0; }
+</style>
+<h1>cr-sqlite × OPFS (AccessHandlePoolVFS) — Step-0 de-risking spike</h1>
+<div id="status" class="running">running…</div>
+<pre id="log"></pre>
+<script type="module">
+  const logEl = document.getElementById("log");
+  const statusEl = document.getElementById("status");
+  const w = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
+  w.onmessage = (e) => {
+    const { line, cls, done, failures } = e.data;
+    if (line != null) {
+      const div = document.createElement("div");
+      div.className = cls || "";
+      div.textContent = line;
+      logEl.appendChild(div);
+    }
+    if (done) {
+      statusEl.className = failures === 0 ? "pass" : "fail";
+      statusEl.textContent = failures === 0 ? "🟢 PASSED" : "🔴 FAILED";
+    }
+  };
+  w.onerror = (e) => {
+    statusEl.className = "fail";
+    statusEl.textContent = "🔴 worker error";
+    const div = document.createElement("div");
+    div.className = "fail";
+    div.textContent = "worker error: " + e.message;
+    logEl.appendChild(div);
+  };
+</script>

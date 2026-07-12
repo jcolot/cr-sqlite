@@ -157,6 +157,83 @@ wrapper against upstream's `sqlite-api.js`, and run cr-sqlite's existing trigger
 async seam behaves on the first VFS, the rest is small. If it fights on
 concurrency, that's where the time goes.
 
+# ✅ Spike results — cr-sqlite runs on OPFS (2026-07-12)
+
+We actually ran the de-risking step. Built this fork's WASM with the current
+unpinned toolchain (`wasm-build/build.sh`) and drove cr-sqlite on the SAB-free
+OPFS VFS (`AccessHandlePoolVFS`) in Chrome via a standalone harness
+(`wasm-build/opfs-spike/`, served by `serve.mjs`, no monorepo/Cypress).
+
+**Result: green.** cr-sqlite boots, `crsql_as_crr` succeeds, `crsql_changes`
+tracks the inserts, and data persists across close+reopen — all over OPFS. But
+getting there uncovered **three real issues**, each isolated by instrumentation.
+Two required source fixes; one is a build-config requirement.
+
+### Issue 1 — resizable `ArrayBuffer` (incidental, fixed by build flag)
+
+Modern emscripten with `ALLOW_MEMORY_GROWTH=1` backs the WASM heap with a
+*resizable* `ArrayBuffer`. OPFS `FileSystemSyncAccessHandle.read/write` **and**
+`TextDecoder.decode` both reject views/buffers that are resizable
+(`"must not be resizable"`). Hit it first in the VFS, then in emscripten's own
+string glue. Fixed for the spike with `-sALLOW_MEMORY_GROWTH=0
+-sINITIAL_MEMORY=128MB`. Production alternative: use a resizable-buffer-aware VFS
+(upstream v1's `OPFSCoopSyncVFS` et al. already handle this).
+
+### Issue 2 — Asyncify is the wrong build for a synchronous VFS
+
+`AccessHandlePoolVFS` is fully synchronous, so it needs the **`crsqlite-sync.mjs`**
+(no-Asyncify) build, not `crsqlite.mjs`. On the Asyncify build, `crsql_as_crr`
+overflowed the **native wasm call stack** (`RangeError: Maximum call stack size
+exceeded`) — cr-sqlite reenters SQLite (nested `prepare`/`step` via a `pragma_*`
+vtab inside `is_table_compatible`), and Asyncify's per-frame instrumentation
+inflates each frame enough to exhaust the wasm stack on that shallow reentrancy.
+`STACK_SIZE` (linear-memory stack) does **not** help — it's the call stack.
+Switching to the sync build (and `const async = false` in the vlcn
+`sqlite-api.js`, which hardcodes `true`) removes the overhead and the overflow.
+Implication: an *async* VFS (IndexedDB, or async OPFS) should use **JSPI** on
+upstream v1, not Asyncify, for cr-sqlite's reentrancy.
+
+### Issue 3 — a real bug in cr-sqlite: `crsql_rollback_hook` signature (FIXED)
+
+With the sync build, `crsql_as_crr` then hit `RuntimeError: function signature
+mismatch` in `sqlite3RollbackAll`. Root cause is a genuine ABI bug:
+
+- SQLite's rollback callback is `void(*)(void*)` (sqlite3.h), and the C decl in
+  `src/crsqlite.c` matches: `void crsql_rollback_hook(void*)`.
+- But the Rust impl (`rs/core/src/commit.rs`) was
+  `extern "C" fn crsql_rollback_hook(*mut c_void) -> *const c_void` — return type
+  `*const c_void`, giving the function wasm type `(i32)->i32`.
+- `sqlite3RollbackAll` does `call_indirect` with type `(i32)->void`. WASM enforces
+  **exact** `call_indirect` type equality, so it traps. (Harmless on native ABIs,
+  where a void-expecting caller just ignores the returned register — which is why
+  it was latent. The original bitcode-LTO build also masked it by unifying types
+  during whole-program codegen.)
+
+**Fix:** make the Rust hook return `void`. One-liner in `commit.rs`. This is
+upstream-worthy — it's wrong on any strict-`call_indirect` target, not just here.
+
+### Also fixed: `build.sh` never actually built
+
+The harness `Makefile`'s `deps` target is an empty `.PHONY` (inherited from vlcn),
+so `sqlite3-extra.c` / `extension-functions.c` were never generated and
+`make dist` aborted with `No rule to make target 'tmp/obj/dist/sqlite3-extra.o'`.
+Fixed by pre-generating them (`make crsqlite-extra` +
+`make deps/extension-functions.c`) before `make dist`.
+
+### Net takeaways for the migration
+
+- **OPFS is not the risk.** cr-sqlite's CRDT machinery works over a sync OPFS VFS.
+- The two source fixes (`commit.rs`, `build.sh`) are prerequisites for *any* WASM
+  cr-sqlite (they're in the core/build, not the VFS or wrapper).
+- **Build/async-model choice matters:** sync VFS → sync build; async VFS → JSPI
+  (upstream v1), not Asyncify, because of cr-sqlite's reentrancy.
+- The resizable-buffer issue is another concrete argument for upstream v1's
+  OPFS VFSes over porting vlcn's older `AccessHandlePoolVFS`.
+
+Reproduce: `cd wasm-build/opfs-spike && node serve.mjs`, open in Chrome. See that
+dir's `README.md`. (The `crsqlite-sync.*` artifacts there are the fixed sync
+debug build.)
+
 # Android / Capacitor deployment
 
 Separate question from the v1.x migration: how to get cr-sqlite into a
