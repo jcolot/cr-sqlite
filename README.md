@@ -9,6 +9,21 @@ A component of the [vulcan](https://vlcn.io) project.
 
 [![](https://dcbadge.vercel.app/api/server/AtdVY6zDW3)](https://discord.gg/AtdVY6zDW3)
 
+# About this fork
+
+This is a fork of [superfly/cr-sqlite](https://github.com/superfly/cr-sqlite) (which maintains the **native** loadable extension but deleted the browser/WASM build chain). This fork's focus is bringing the **browser-WASM build back to life on a modern toolchain** and proving it on OPFS. Everything lives under [wasm-build/](wasm-build/):
+
+- **Resurrected browser-WASM build** ([wasm-build/build.sh](wasm-build/build.sh)) on a current, **unpinned** toolchain (any recent Rust nightly + latest emscripten). The Rust core links as a wasm static archive instead of LLVM bitcode, removing vlcn's brittle `nightly-2023-10-05`/`emsdk 3.1.45` pin. See [wasm-build/README.md](wasm-build/README.md).
+- **wa-sqlite v1.x build** ([wasm-build/build-v1.sh](wasm-build/build-v1.sh)): cr-sqlite compiled against upstream [rhashimoto/wa-sqlite](https://github.com/rhashimoto/wa-sqlite) v1.1.1 (SQLite 3.53) instead of vlcn's 0.22 fork — CRR bulk inserts and scans measure ~2× faster. Migration analysis and results in [wasm-build/notes-v1-migration.md](wasm-build/notes-v1-migration.md).
+- **OPFS proven**: cr-sqlite runs green on OPFS in Chrome using the fully-synchronous `AccessHandlePoolVFS` (sync build). Key finding: cr-sqlite's open-time extension init requires a fully-synchronous VFS — cooperative-locking VFSes like `OPFSCoopSyncVFS` break it. Spikes in [wasm-build/opfs-spike/](wasm-build/opfs-spike/) and [wasm-build/opfs-spike-v1/](wasm-build/opfs-spike-v1/).
+- **Multi-tab support**: `AccessHandlePoolVFS` is single-connection (OPFS access handles are origin-exclusive), so multi-tab works via **Web Locks leader election + BroadcastChannel** — one leader tab owns the DB in a dedicated Worker, followers route queries to it. Built and working in [wasm-build/opfs-spike-multitab/](wasm-build/opfs-spike-multitab/).
+- **Core ABI fix**: `crsql_rollback_hook` returned `*const c_void` where SQLite expects `void(*)(void*)` — harmless on native ABIs, but a `call_indirect` type-mismatch trap on WASM. Fixed in [commit.rs](core/rs/core/src/commit.rs) (upstream-worthy).
+- **Android/Capacitor deployment analysis** — native static-link vs WASM+OPFS vs WASM+IndexedDB paths, in [wasm-build/notes-v1-migration.md](wasm-build/notes-v1-migration.md).
+
+The JS wrapper (`@vlcn.io/crsqlite-wasm`) repointed onto the v1 harness lives in the companion fork [jcolot/js](https://github.com/jcolot/js).
+
+The rest of this README is upstream documentation.
+
 # Examples
 
 Example applications using cr-sqlite to sync state.
@@ -158,7 +173,7 @@ load_extension(extension_path, 'sqlite3_crsqlite_init')
 
 > Note: if you're using `cr-sqlite` as a run time loadable extension, loading the extension should be the _first_ operation you do after opening a connection to the database. The extension needs to be loaded on every connection you create.
 
-For a WASM build that works in the browser, see the [js](https://github.com/vlcn-io/js) directory.
+For a WASM build that works in the browser, see [wasm-build/](wasm-build/) in this fork (the upstream builds lived in the [js](https://github.com/vlcn-io/js) repo, since deleted here).
 
 For UI integrations (e.g., React) see the [js](https://github.com/vlcn-io/js) directory.
 
@@ -259,7 +274,12 @@ This will create a shared library at `dist/crsqlite.[lib extension]`
 
 ## WASM
 
-For a WASM build that works in the browser, see the [js](https://github.com/vlcn-io/js) repository.
+This fork builds the browser WASM artifacts directly — see [wasm-build/README.md](wasm-build/README.md):
+
+```bash
+./wasm-build/build.sh     # vlcn wa-sqlite 0.22 harness → wasm-build/dist/
+./wasm-build/build-v1.sh  # upstream wa-sqlite v1.x harness → wasm-build/dist-v1/
+```
 
 ## CLI
 
