@@ -358,14 +358,25 @@ transactions, coordinates via Web Locks), is exactly the one that breaks cr-sqli
 open-time extension init. So on the sync build you get **fast + single-connection**, and
 you cannot simply switch to the cooperative VFS to get multi-tab.
 
-**How to actually support multiple tabs** (standard OPFS pattern, unchanged by cr-sqlite):
+**How to actually support multiple tabs** (standard OPFS pattern, unchanged by cr-sqlite).
+This is **built and working** in `wasm-build/opfs-spike-multitab/` — two tabs share one
+connection with live cross-tab updates. Getting there surfaced two more browser
+constraints beyond the single-connection VFS, both of which rule out the obvious
+SharedWorker-owns-the-DB design in Chrome:
 
-1. **One owner, many clients (recommended).** Put the DB in a *single* shared owner — a
-   `SharedWorker`, or a dedicated Worker elected via `navigator.locks` leader election —
-   and have every tab talk to it over `MessagePort`. All tabs share one connection, so
-   the exclusive-handle constraint is satisfied by construction. This is also the exact
-   shape the Capacitor plan uses (a Worker owns the DB). cr-sqlite's `onUpdate` in the
-   owner can broadcast change notifications to all tabs.
+- **OPFS `createSyncAccessHandle` is dedicated-worker-only** — it throws in a SharedWorker.
+- **A SharedWorker can't spawn a dedicated Worker** — `Worker` is `undefined` in
+  `SharedWorkerGlobalScope`, so it can't even delegate the DB to one.
+
+So the working design is **Web Locks leader election + BroadcastChannel**, not SharedWorker:
+
+1. **One owner, many clients (recommended, and validated).** Every tab contends for an
+   exclusive Web Lock; the holder is the *leader* and the only tab that opens the DB — it
+   spawns a dedicated Worker holding the single cr-sqlite/OPFS connection. Followers route
+   queries to the leader over a `BroadcastChannel`; the owner's `onUpdate` is broadcast so
+   all tabs refresh live. Leader closes → a follower re-acquires the lock and takes over.
+   No SharedWorker, so it also ports directly to the Capacitor/Android WebView. See
+   `opfs-spike-multitab/README.md`.
 2. **IndexedDB VFS instead of OPFS.** `IDBBatchAtomicVFS` (v0/vlcn default, also in v1)
    coordinates multiple connections via Web Locks + batch-atomic writes, so it tolerates
    multiple tabs directly — at a real performance cost vs OPFS (IDB is the slow path).
