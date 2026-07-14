@@ -32,12 +32,7 @@ fi
 # shellcheck disable=SC1091
 source "$EMSDK_DIR/emsdk_env.sh"
 
-# 2. Patch the (vlcn) submodule for modern rustc ---------------------------
-SRE="$CORE_DIR/core/rs/sqlite-rs-embedded"
-perl -0pi -e 's/^#!\[feature\(concat_idents\)\]\n//m' "$SRE/sqlite3_capi/src/lib.rs" || true
-perl -0pi -e 's/^#!\[feature\(error_in_core\)\]\n//m'  "$SRE/sqlite_nostd/src/lib.rs" || true
-
-# 3. Harness: rhashimoto's wa-sqlite v1.x, with our overrides ---------------
+# 2. Harness: rhashimoto's wa-sqlite v1.x, with our overrides ---------------
 if [ ! -d "$WORK/wa-sqlite" ]; then
   git clone --depth 1 https://github.com/rhashimoto/wa-sqlite.git "$WORK/wa-sqlite"
 fi
@@ -45,7 +40,7 @@ cd "$WORK/wa-sqlite"
 ln -sfn "$CORE_DIR/core" crsql
 cp "$HERE/harness-overrides-v1/Makefile" Makefile
 
-# 4. Build -----------------------------------------------------------------
+# 3. Build -----------------------------------------------------------------
 export CRSQLITE_COMMIT_SHA="$(git -C "$CORE_DIR" rev-parse HEAD)"
 rm -rf tmp dist
 

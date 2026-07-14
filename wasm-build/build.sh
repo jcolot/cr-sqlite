@@ -27,9 +27,9 @@
 # Source patches this build needs (all carried/applied here):
 #   * core/rs/bundle/src/lib.rs: `use core::alloc::Layout;` (committed in
 #     this fork — the wasm-only alloc-error handler referenced it).
-#   * sqlite-rs-embedded submodule (vlcn's), applied at build time below:
-#       - drop `#![feature(concat_idents)]`  (removed from rustc; unused)
-#       - drop `#![feature(error_in_core)]`   (stabilised in Rust 1.81)
+#   * sqlite-rs-embedded is now superfly's fork, which builds on stable
+#     rustc (drops `concat_idents`/`error_in_core`), so no build-time
+#     source patch of the submodule is needed anymore.
 #
 # emscripten-6 compat (baked into harness-overrides/Makefile + the json):
 #   * export HEAP views in EXPORTED_RUNTIME_METHODS (no longer automatic)
@@ -52,12 +52,7 @@ fi
 # shellcheck disable=SC1091
 source "$WORK/emsdk/emsdk_env.sh"
 
-# 2. Patch the (vlcn) submodule for modern rustc ---------------------------
-SRE="$CORE_DIR/core/rs/sqlite-rs-embedded"
-perl -0pi -e 's/^#!\[feature\(concat_idents\)\]\n//m' "$SRE/sqlite3_capi/src/lib.rs"
-perl -0pi -e 's/^#!\[feature\(error_in_core\)\]\n//m'  "$SRE/sqlite_nostd/src/lib.rs"
-
-# 3. Harness: vlcn's wa-sqlite, with our modern overrides -------------------
+# 2. Harness: vlcn's wa-sqlite, with our modern overrides -------------------
 if [ ! -d "$WORK/wa-sqlite" ]; then
   git clone --depth 1 https://github.com/vlcn-io/wa-sqlite.git "$WORK/wa-sqlite"
 fi
@@ -66,7 +61,7 @@ ln -sfn "$CORE_DIR/core" crsql
 cp "$HERE/harness-overrides/Makefile" Makefile
 cp "$HERE/harness-overrides/extra_exported_runtime_methods.json" src/extra_exported_runtime_methods.json
 
-# 4. Build -----------------------------------------------------------------
+# 3. Build -----------------------------------------------------------------
 export CRSQLITE_COMMIT_SHA="$(git -C "$CORE_DIR" rev-parse HEAD)"
 rm -rf tmp dist
 
